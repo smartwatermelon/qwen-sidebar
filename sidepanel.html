@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Qwen Sidebar</title>
+  <style>
+    body { font-family: system-ui, sans-serif; padding: 16px; background: #1e1e1e; color: #e0e0e0; margin: 0; }
+    .status { padding: 8px; border-radius: 4px; margin-bottom: 16px; font-weight: bold; font-size: 14px; }
+    .connected { background: #1b4d2e; color: #4ade80; }
+    .disconnected { background: #4d1b1b; color: #f87171; }
+    button { background: #3b82f6; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-size: 14px; }
+    button:hover { background: #2563eb; }
+    .debug { margin-top: 16px; font-size: 12px; color: #888; }
+  </style>
+</head>
+<body>
+  <h3 style="margin-top:0">Qwen Sidebar</h3>
+  <div id="status" class="status disconnected">Checking auth...</div>
+  <button id="refreshBtn">Refresh Auth Status</button>
+  <div id="debug" class="debug"></div>
+  <script src="sidepanel.js"></script>
+</body>
+</html>
