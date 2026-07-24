@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "description": "Qwen sidebar with DOM interactivity",
   "permissions": ["sidePanel", "storage", "activeTab", "scripting"],
-  "host_permissions": ["https://chat.qwen.ai/*"],
+  "host_permissions": ["https://*/*", "http://*/*", "https://chat.qwen.ai/*"],
   "action": {
     "default_title": "Open Qwen Sidebar"
   },
@@ -16,7 +16,7 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://chat.qwen.ai/*"],
+      "matches": ["https://*/*", "http://*/*"],
       "js": ["content.js"],
       "run_at": "document_idle"
     }

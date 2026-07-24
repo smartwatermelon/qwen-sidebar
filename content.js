@@ -37,4 +37,45 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     });
     return true; // Keep channel open for async response
   }
+
+  if (message.type === "GET_PAGE_CONTEXT") {
+    // 1. Check for user selection first
+    const selection = window.getSelection().toString().trim();
+    if (selection) {
+      sendResponse({
+        type: "selection",
+        text: selection,
+      });
+      return true;
+    }
+
+    // 2. Fallback: Extract main content heuristically
+    // Grab text from semantic elements to avoid navbars, footers, and ads
+    const elements = document.querySelectorAll(
+      "p, h1, h2, h3, h4, h5, h6, li, pre, code, article, main",
+    );
+    let text = Array.from(elements)
+      .map((el) => el.innerText.trim())
+      .filter((t) => t.length > 0)
+      .join("\n");
+
+    // 3. Ultimate fallback
+    if (!text || text.length < 50) {
+      text = document.body.innerText;
+    }
+
+    // 4. Clean and limit to avoid token overflow
+    text = text.replace(/\n\s*\n/g, "\n").trim();
+    const maxLength = 4000;
+    const truncatedText =
+      text.length > maxLength
+        ? text.substring(0, maxLength) + "\n\n[Content truncated for length...]"
+        : text;
+
+    sendResponse({
+      type: "page",
+      text: truncatedText,
+    });
+    return true;
+  }
 });
