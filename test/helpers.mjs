@@ -109,12 +109,12 @@ export function runInPage(func, pageGlobals) {
 /**
  * @param {object} opts
  * @param {Array}  opts.tabs      tabs visible to chrome.tabs.query
- * @param {object} opts.session   initial chrome.storage.session contents
+ * @param {object} opts.local     initial chrome.storage.local contents (config)
  * @param {Function} opts.inject  ({tabId, func}) => InjectionResult[] | throws
  * @param {Function} opts.fetch   stub for the chat completions call
  */
 export function loadBackground(opts = {}) {
-  const session = { ...(opts.session || {}) };
+  const local = { ...(opts.local || {}) };
   const tabs = opts.tabs || [];
   const queries = [];
   let listener = null;
@@ -130,13 +130,25 @@ export function loadBackground(opts = {}) {
     },
     action: { onClicked: { addListener: () => {} } },
     storage: {
-      session: {
-        get: async (key) => (key in session ? { [key]: session[key] } : {}),
+      local: {
+        // chrome.storage.local.get accepts a string, an array of keys, or null
+        // for everything. background.js uses the array form.
+        get: async (keys) => {
+          if (Array.isArray(keys)) {
+            const out = {};
+            for (const key of keys) if (key in local) out[key] = local[key];
+            return out;
+          }
+          if (typeof keys === "string") {
+            return keys in local ? { [keys]: local[keys] } : {};
+          }
+          return { ...local };
+        },
         set: async (obj) => {
-          Object.assign(session, obj);
+          Object.assign(local, obj);
         },
         remove: async (key) => {
-          delete session[key];
+          delete local[key];
         },
       },
     },
@@ -196,7 +208,7 @@ export function loadBackground(opts = {}) {
   return {
     send,
     listener,
-    session,
+    local,
     queries,
     sandbox,
     get replyCount() {

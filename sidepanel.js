@@ -3,7 +3,16 @@ const userInput = document.getElementById("user-input");
 const sendBtn = document.getElementById("send-btn");
 const statusEl = document.getElementById("status");
 const contextBtn = document.getElementById("context-btn");
-const refreshAuthBtn = document.getElementById("refresh-auth-btn");
+const settingsBtn = document.getElementById("settings-btn");
+const settingsPanel = document.getElementById("settings");
+const apiKeyInput = document.getElementById("api-key-input");
+const modelInput = document.getElementById("model-input");
+const baseUrlInput = document.getElementById("base-url-input");
+const saveSettingsBtn = document.getElementById("save-settings-btn");
+const clearKeyBtn = document.getElementById("clear-key-btn");
+const settingsFeedback = document.getElementById("settings-feedback");
+
+const MAX_HISTORY_MESSAGES = 20;
 
 let messageHistory = [];
 let isWaiting = false;
@@ -13,37 +22,83 @@ let authHintShown = false;
 checkStatus();
 
 async function checkStatus() {
-  let isAuthenticated = false;
+  let status = null;
   try {
-    const response = await chrome.runtime.sendMessage({
-      type: "GET_AUTH_STATUS",
-    });
-    isAuthenticated = !!(response && response.isAuthenticated);
+    status = await chrome.runtime.sendMessage({ type: "GET_AUTH_STATUS" });
   } catch {
-    isAuthenticated = false;
+    status = null;
   }
 
-  if (isAuthenticated) {
-    statusEl.textContent = "Authenticated";
+  if (status) {
+    populateSettings(status);
+  }
+
+  if (status && status.pairingError) {
+    // A stored key/URL combination that would bill the wrong channel. Surface
+    // it rather than waiting for the user to hit Send.
+    statusEl.textContent = "Misconfigured";
+    statusEl.className = "status disconnected";
+    settingsFeedback.textContent = status.pairingError;
+    settingsFeedback.className = "settings-error";
+    settingsPanel.classList.add("open");
+    return;
+  }
+
+  if (status && status.isAuthenticated) {
+    statusEl.textContent = `Ready · ${status.model}`;
     statusEl.className = "status connected";
-    // Re-arm the hint so it reappears if authentication is later lost.
+    // Re-arm the hint so it reappears if the key is later removed.
     authHintShown = false;
     return;
   }
 
-  statusEl.textContent = "Not Authenticated";
+  statusEl.textContent = "No API key";
   statusEl.className = "status disconnected";
 
-  // Show the guidance once per unauthenticated stretch. checkStatus() runs on
-  // load and after every Refresh Auth attempt, so repeated failures would
-  // otherwise stack identical messages in the transcript.
+  // Show the guidance once per unconfigured stretch. checkStatus() runs on load
+  // and after every save, so repeated failures would otherwise stack identical
+  // messages in the transcript.
   if (!authHintShown) {
     authHintShown = true;
+    settingsPanel.classList.add("open");
     appendMessage(
       "error",
-      "Please open https://chat.qwen.ai/ in a tab, ensure you are logged in, and click the 'Refresh Auth' button in the header.",
+      "Paste your Alibaba Model Studio API key in Settings to get started.",
     );
   }
+}
+
+// Renders current config into the settings panel. The API key is never returned
+// by the background script, so the field shows a masked hint as a placeholder
+// and stays empty unless the user is entering a new key.
+function populateSettings(status) {
+  if (Array.isArray(status.models) && modelInput.options.length === 0) {
+    for (const name of status.models) {
+      const option = document.createElement("option");
+      option.value = name;
+      option.textContent = name;
+      modelInput.appendChild(option);
+    }
+  }
+
+  // Compare option values directly rather than building a CSS selector from
+  // stored data — a quote in the value would throw SyntaxError out of here and
+  // abort checkStatus() before the status pill is set.
+  const known = Array.from(modelInput.options).some(
+    (option) => option.value === status.model,
+  );
+  if (status.model && !known) {
+    const option = document.createElement("option");
+    option.value = status.model;
+    option.textContent = `${status.model} (custom)`;
+    modelInput.appendChild(option);
+  }
+
+  if (status.model) modelInput.value = status.model;
+  if (status.baseUrl) baseUrlInput.value = status.baseUrl;
+  apiKeyInput.placeholder = status.keyHint
+    ? `saved ${status.keyHint}`
+    : "sk-sp-...";
 }
 
 function appendMessage(role, text) {
@@ -121,17 +176,29 @@ async function sendMessage() {
       appendMessage(
         "error",
         response.error +
-          (response.details ? `: ${JSON.stringify(response.details)}` : ""),
+          (response.details
+            ? // Already a redacted string from the background script;
+              // re-stringifying would render it as an escaped-quote blob.
+              `: ${typeof response.details === "string" ? response.details : JSON.stringify(response.details)}`
+            : ""),
       );
       restoreDraft("Not sent: " + response.error);
-      if (response.authExpired) {
-        // The token was rejected and has been cleared; resync the status pill
-        // so it stops reading "Authenticated".
+      if (response.needsConfig) {
+        // Missing, rejected, or mispaired credentials — resync the status pill
+        // and put the settings panel in front of the user rather than making
+        // them hunt for it.
+        settingsPanel.classList.add("open");
         await checkStatus();
       }
     } else if (response && response.content) {
       appendMessage("assistant", response.content);
       messageHistory.push({ role: "assistant", content: response.content });
+      // Every send posts the whole history, and a page-context block is up to
+      // 4000 characters. Unbounded, that spends quota quadratically against a
+      // capped plan. Older turns stay visible in the transcript.
+      if (messageHistory.length > MAX_HISTORY_MESSAGES) {
+        messageHistory = messageHistory.slice(-MAX_HISTORY_MESSAGES);
+      }
     } else {
       appendMessage("error", "Empty or malformed response from API.");
       restoreDraft("Not sent: empty or malformed response");
@@ -151,31 +218,73 @@ async function sendMessage() {
   }
 }
 
-// Handle "Refresh Auth" button
-refreshAuthBtn.addEventListener("click", async () => {
-  refreshAuthBtn.disabled = true;
-  refreshAuthBtn.textContent = "Checking...";
+settingsBtn.addEventListener("click", () => {
+  settingsPanel.classList.toggle("open");
+  if (settingsPanel.classList.contains("open")) apiKeyInput.focus();
+});
+
+saveSettingsBtn.addEventListener("click", async () => {
+  saveSettingsBtn.disabled = true;
+  settingsFeedback.textContent = "Saving...";
+  settingsFeedback.className = "hint";
+
+  // Only send apiKey when the user actually typed one, so leaving the field
+  // blank edits the model or base URL without clearing a stored key.
+  const config = {
+    model: modelInput.value,
+    baseUrl: baseUrlInput.value,
+  };
+  if (apiKeyInput.value.trim()) {
+    config.apiKey = apiKeyInput.value.trim();
+  }
 
   try {
-    // background.js performs the tab lookup, the origin check and the injection,
-    // so the bearer token never passes through this context.
     const response = await chrome.runtime.sendMessage({
-      type: "REFRESH_AUTH",
-      windowId: await getHostWindowId(),
+      type: "SAVE_CONFIG",
+      config: config,
     });
 
     if (response && response.error) {
-      appendMessage("error", response.error);
-    } else {
-      await checkStatus();
+      settingsFeedback.textContent = response.error;
+      settingsFeedback.className = "settings-error";
+      return;
     }
+
+    settingsFeedback.textContent = "Saved.";
+    settingsFeedback.className = "hint";
+    await checkStatus();
   } catch (err) {
-    // Surface the real cause: this path covers a suspended service worker and a
-    // failed storage write, not just tab connectivity.
-    appendMessage("error", "Refresh Auth failed: " + err.message);
+    settingsFeedback.textContent = "Save failed: " + err.message;
+    settingsFeedback.className = "settings-error";
   } finally {
-    refreshAuthBtn.disabled = false;
-    refreshAuthBtn.textContent = "Refresh Auth";
+    // Clear on every outcome, not just success, so a pasted key is never left
+    // sitting in the DOM after a rejected save.
+    apiKeyInput.value = "";
+    saveSettingsBtn.disabled = false;
+  }
+});
+
+clearKeyBtn.addEventListener("click", async () => {
+  clearKeyBtn.disabled = true;
+  try {
+    // null is the explicit "remove it" sentinel; a blank field means "unchanged"
+    // so that editing the model doesn't silently wipe the key.
+    const response = await chrome.runtime.sendMessage({
+      type: "SAVE_CONFIG",
+      config: { apiKey: null },
+    });
+
+    settingsFeedback.textContent =
+      response && response.error ? response.error : "Key cleared.";
+    settingsFeedback.className =
+      response && response.error ? "settings-error" : "hint";
+    await checkStatus();
+  } catch (err) {
+    settingsFeedback.textContent = "Clear failed: " + err.message;
+    settingsFeedback.className = "settings-error";
+  } finally {
+    apiKeyInput.value = "";
+    clearKeyBtn.disabled = false;
   }
 });
 

@@ -1,13 +1,45 @@
-// Origin that is allowed to supply the Qwen auth token. Compared against a
-// parsed URL origin, never a string prefix: "https://chat.qwen.ai.evil.com" and
-// "https://chat.qwen.ai@evil.com" both pass a startsWith() check.
-const QWEN_ORIGIN = "https://chat.qwen.ai";
+// Schemes we can inject into. https only: the manifest no longer requests
+// http://*/*, so an http page would fail injection with an opaque error rather
+// than this clear message. An allowlist also rejects chrome://, edge://,
+// about:, chrome-extension://, devtools://, view-source:, file:, data: and
+// blob: in one check — a denylist of known-bad schemes kept missing cases.
+const INJECTABLE_PROTOCOLS = new Set(["https:"]);
 
-// Schemes we can inject into. host_permissions covers http/https only, so an
-// allowlist rejects chrome://, edge://, about:, chrome-extension://,
-// devtools://, view-source:, file:, data: and blob: in one check — a denylist of
-// known-bad schemes kept missing cases.
-const INJECTABLE_PROTOCOLS = new Set(["http:", "https:"]);
+// Alibaba Model Studio billing modes are isolated: a credential and a base URL
+// must be used as a matching pair. Their docs warn that mixing them either
+// routes the request to the pay-as-you-go channel — billing real money against
+// an account the user believes is on a flat subscription — or returns 401/403.
+// checkKeyHostPairing() below refuses to send rather than risk the former.
+const TOKEN_PLAN_KEY_PREFIX = "sk-sp-";
+const TOKEN_PLAN_BASE_URL =
+  "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1";
+
+// Matched against a parsed hostname, never a string prefix. A prefix test on
+// "https://token-plan." admits https://token-plan.evil.com — the same class of
+// bug as the chat.qwen.ai origin check this migration replaced. Region varies
+// (ap-southeast-1, cn-beijing, ...), so the label is a wildcard but the
+// registrable domain is pinned.
+const TOKEN_PLAN_HOST = /^token-plan\.[a-z0-9-]+\.maas\.aliyuncs\.com$/;
+
+// The Token Plan model list is an exact-match allowlist — a version or variant
+// mismatch is rejected upstream rather than silently downgraded. Note that
+// qwen3.5-flash, used before this migration, is not on it.
+const TOKEN_PLAN_MODELS = [
+  "qwen3.8-max-preview",
+  "qwen3.7-max",
+  "qwen3.7-plus",
+  "qwen3.6-flash",
+  "glm-5.2",
+  "deepseek-v4-pro",
+];
+
+const CONFIG_DEFAULTS = {
+  apiKey: "",
+  baseUrl: TOKEN_PLAN_BASE_URL,
+  model: "qwen3.6-flash",
+};
+
+const CHAT_TIMEOUT_MS = 60000;
 
 function parseUrl(rawUrl) {
   if (!rawUrl) return null;
@@ -55,9 +87,9 @@ async function injectAndRead(tabId, func) {
   return frame.result;
 }
 
-// --- Injected page functions -------------------------------------------------
-// These are serialized and run in the page, so they must be fully
-// self-contained: no imports, no closure over anything above.
+// --- Injected page function --------------------------------------------------
+// Serialized and run in the page, so it must be fully self-contained: no
+// imports, no closure over anything above.
 
 function extractPageContent() {
   const MAX_LENGTH = 4000;
@@ -70,17 +102,20 @@ function extractPageContent() {
       ? raw.substring(0, MAX_LENGTH) + TRUNCATION_NOTE
       : raw;
 
+  // Provenance is read here, in the page, rather than from the caller's
+  // pre-injection tabs.query snapshot. A tab that navigates between the
+  // protocol check and the injection would otherwise label the new page's text
+  // with the old page's URL and title — a trusted label on untrusted content.
+  const provenance = { url: location.href, title: document.title || "" };
+
   // 1. An explicit user selection is the strongest signal of intent.
   const selection = window.getSelection();
   const selected = clean(selection ? selection.toString() : "");
   if (selected) {
-    return { type: "selection", text: limit(selected) };
+    return { type: "selection", text: limit(selected), ...provenance };
   }
 
   // 2. Otherwise pull block elements from the main content region.
-  //    <article>/<main> are containers, not peers of the blocks below — their
-  //    innerText already contains every child paragraph, so matching both in one
-  //    selector emits the whole page and then every paragraph again.
   //    <main> is unique per spec, so it is a safe root. <article> is not:
   //    listing pages carry one per card, and a promo or "related posts" widget
   //    can precede the real content — rooting at the first one silently drops
@@ -135,69 +170,164 @@ function extractPageContent() {
     }
   }
 
-  return { type: "page", text: limit(text) };
+  return { type: "page", text: limit(text), ...provenance };
 }
 
-function readAuthToken() {
-  // The origin is re-checked here, in the page, rather than relying solely on
-  // the caller's check. That check runs against tab.url before injection, and a
-  // tab.id survives navigation while its URL does not — so a tab that navigates
-  // in between would have the *new* origin's localStorage read and stored as the
-  // Qwen credential. In-page, the check and the read are atomic.
-  //
-  // The origin literal is duplicated from QWEN_ORIGIN deliberately: this
-  // function is serialized into the page and cannot close over module scope.
-  // Keep the two in sync.
-  if (location.origin !== "https://chat.qwen.ai") {
-    return null;
-  }
-  return localStorage.getItem("token") || localStorage.getItem("access_token");
+// --- Configuration -----------------------------------------------------------
+
+// chrome.storage.local, not session: an API key the user pasted should survive a
+// browser restart. local is not synced, so the key never leaves this machine.
+async function getConfig() {
+  const stored =
+    (await chrome.storage.local.get(Object.keys(CONFIG_DEFAULTS))) || {};
+  // Coerce to string: storage is shared with anything that can write to this
+  // extension's area, and a non-string apiKey would throw out of getStatus()
+  // into an unhandled rejection, leaving the panel stuck on "Checking...".
+  return {
+    apiKey: String(stored.apiKey ?? CONFIG_DEFAULTS.apiKey),
+    baseUrl: String(stored.baseUrl ?? CONFIG_DEFAULTS.baseUrl),
+    model: String(stored.model ?? CONFIG_DEFAULTS.model),
+  };
 }
 
-// --- Message handlers --------------------------------------------------------
+// Strips the credential from any text that crosses back to the panel. Applied
+// at every exit that can carry an upstream response body, not just the !ok
+// branch — a 200 with an unexpected shape reaches the transcript too.
+function redactSecret(text, secret) {
+  const out = String(text ?? "");
+  const withoutValue = secret ? out.split(secret).join("[redacted]") : out;
+  return withoutValue.replace(/Bearer\s+\S+/gi, "Bearer [redacted]");
+}
 
-async function storeToken(token) {
-  if (!token || typeof token !== "string" || !token.trim()) {
-    return { status: "error", error: "Empty token." };
+function normalizeBaseUrl(baseUrl) {
+  return String(baseUrl || "").replace(/\/+$/, "");
+}
+
+function isTokenPlanHost(baseUrl) {
+  const url = parseUrl(baseUrl);
+  if (!url || url.protocol !== "https:") return false;
+  return TOKEN_PLAN_HOST.test(url.hostname);
+}
+
+// Rejects a base URL that is unparseable or not https. This is a security
+// control, distinct from the billing-mode pairing check below: without it a
+// pay-as-you-go key pairs happily with http://attacker.example/v1 and the
+// bearer token goes out in cleartext.
+function checkBaseUrl(baseUrl) {
+  const url = parseUrl(baseUrl);
+  if (!url) return "Base URL must be a valid absolute URL.";
+  if (url.protocol !== "https:") return "Base URL must use https://.";
+  return null;
+}
+
+// Returns an error string when the credential and endpoint belong to different
+// billing modes, or null when the pairing is valid.
+//
+// Deliberately silent when neither side is Token Plan: this is an
+// OpenAI-compatible client and a pay-as-you-go key is allowed to point at any
+// https endpoint the user configures (a gateway, a proxy, a self-hosted
+// compatible server). That is a user decision, not an attack surface — nothing
+// untrusted can write baseUrl, and checkBaseUrl() still enforces https. The
+// Token Plan asymmetry exists because mispairing *that* key silently spends
+// money on the wrong channel.
+function checkKeyHostPairing(apiKey, baseUrl) {
+  const planKey = apiKey.startsWith(TOKEN_PLAN_KEY_PREFIX);
+  const planHost = isTokenPlanHost(baseUrl);
+
+  if (planKey && !planHost) {
+    return (
+      "A Token Plan key (sk-sp-) must be paired with the Token Plan endpoint. " +
+      "Sending it elsewhere would bill against pay-as-you-go. Expected: " +
+      TOKEN_PLAN_BASE_URL
+    );
   }
-  await chrome.storage.session.set({ qwenToken: token });
+  if (!planKey && planHost) {
+    return (
+      "The Token Plan endpoint requires a Token Plan key (sk-sp-). " +
+      "A pay-as-you-go key will be rejected with 401."
+    );
+  }
+  return null;
+}
+
+async function getStatus() {
+  const config = await getConfig();
+  return {
+    isAuthenticated: !!config.apiKey,
+    // Never returns the key itself — the panel only needs to know one is
+    // present and which tail it ends with.
+    keyHint: config.apiKey ? `…${config.apiKey.slice(-4)}` : "",
+    baseUrl: config.baseUrl,
+    model: config.model,
+    models: TOKEN_PLAN_MODELS,
+    pairingError: config.apiKey
+      ? checkKeyHostPairing(config.apiKey, config.baseUrl)
+      : null,
+  };
+}
+
+async function saveConfig(patch) {
+  const current = await getConfig();
+  const next = {
+    // null is the explicit "clear the key" sentinel; undefined means "leave it
+    // alone", which is what the panel sends when editing only model or URL.
+    apiKey:
+      patch.apiKey === undefined
+        ? current.apiKey
+        : patch.apiKey === null
+          ? ""
+          : String(patch.apiKey).trim(),
+    baseUrl:
+      patch.baseUrl === undefined
+        ? current.baseUrl
+        : normalizeBaseUrl(patch.baseUrl) || CONFIG_DEFAULTS.baseUrl,
+    model:
+      patch.model === undefined ? current.model : String(patch.model).trim(),
+  };
+
+  // Validate what this patch actually writes, not the merged result. Judging
+  // inherited values would let stale storage — a model later dropped from the
+  // allowlist, a legacy base URL — reject an unrelated write, including
+  // clearing the key, which is the one operation that must always succeed.
+  if (patch.model !== undefined) {
+    if (!next.model) {
+      return { error: "Model cannot be empty." };
+    }
+    if (!TOKEN_PLAN_MODELS.includes(next.model)) {
+      // The upstream list is an exact-match allowlist; a typo would otherwise
+      // be stored and only surface as an opaque error at send time.
+      return { error: `Unknown model "${next.model}".` };
+    }
+  }
+
+  if (patch.baseUrl !== undefined) {
+    const baseUrlError = checkBaseUrl(next.baseUrl);
+    if (baseUrlError) {
+      return { error: baseUrlError };
+    }
+  }
+
+  // Endpoint checks guard a credential, so they apply exactly when one will be
+  // stored. Clearing the key needs no endpoint at all.
+  if (next.apiKey) {
+    const baseUrlError = checkBaseUrl(next.baseUrl);
+    if (baseUrlError) {
+      return { error: baseUrlError };
+    }
+
+    const pairingError = checkKeyHostPairing(next.apiKey, next.baseUrl);
+    if (pairingError) {
+      // Refuse the write rather than storing a combination that spends money on
+      // the wrong channel the next time the user hits Send.
+      return { error: pairingError };
+    }
+  }
+
+  await chrome.storage.local.set(next);
   return { status: "success" };
 }
 
-async function getAuthStatus() {
-  try {
-    const result = await chrome.storage.session.get("qwenToken");
-    return { isAuthenticated: !!(result && result.qwenToken) };
-  } catch {
-    return { isAuthenticated: false };
-  }
-}
-
-// Reads the token from an active chat.qwen.ai tab and stores it. Lives here
-// rather than in the side panel so that every privileged injection sits in the
-// service worker, and so the bearer credential never passes through the UI
-// context that also renders untrusted page text.
-async function refreshAuth(windowId) {
-  const tab = await getActiveTab(windowId);
-  const url = parseUrl(tab && tab.url);
-
-  if (!url || url.origin !== QWEN_ORIGIN) {
-    return {
-      error: "Please switch to the https://chat.qwen.ai/ tab and try again.",
-    };
-  }
-
-  const token = await injectAndRead(tab.id, readAuthToken);
-  if (!token) {
-    // Also the path taken when the tab navigated away between the check above
-    // and the injection, since readAuthToken re-checks the origin in-page.
-    return {
-      error: "No auth token found on chat.qwen.ai. Ensure you are logged in.",
-    };
-  }
-
-  return storeToken(token);
-}
+// --- Message handlers --------------------------------------------------------
 
 async function getPageContext(windowId) {
   const tab = await getActiveTab(windowId);
@@ -206,6 +336,15 @@ async function getPageContext(windowId) {
   }
 
   const url = parseUrl(tab.url);
+  if (url && url.protocol === "http:") {
+    // Distinct from the message below: an intranet page over plain HTTP is
+    // neither internal nor an extension page, and telling the user it is sends
+    // them looking for the wrong problem.
+    return {
+      error:
+        "Page context requires an https page. This extension does not request access to plain HTTP pages.",
+    };
+  }
   if (!url || !INJECTABLE_PROTOCOLS.has(url.protocol)) {
     return {
       error: "Cannot read context from browser internal or extension pages.",
@@ -217,7 +356,14 @@ async function getPageContext(windowId) {
     return { error: "No text found on this page." };
   }
 
-  return { ...extracted, url: tab.url, title: tab.title };
+  // url/title come from inside the page, not from the tab snapshot taken before
+  // injection, so the provenance label always describes the text that was
+  // actually read. Fall back to the tab only if the page withheld them.
+  return {
+    ...extracted,
+    url: extracted.url || tab.url,
+    title: extracted.title || tab.title || "",
+  };
 }
 
 async function sendChatMessage(messages) {
@@ -225,57 +371,66 @@ async function sendChatMessage(messages) {
     return { error: "No messages to send." };
   }
 
-  const stored = await chrome.storage.session.get("qwenToken");
-  if (!stored || !stored.qwenToken) {
+  const config = await getConfig();
+  if (!config.apiKey) {
     return {
-      error: "Not authenticated. Please log in at chat.qwen.ai and refresh.",
+      error: "No API key configured. Open Settings and paste your key.",
+      needsConfig: true,
     };
   }
 
-  // Third-party community proxy that accepts chat.qwen.ai web tokens. Note that
-  // this means the user's Qwen bearer token is transmitted to an operator
-  // unaffiliated with Alibaba.
-  // Future API key upgrade: switch to
-  // "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions".
-  const res = await fetch("https://qwen.aikit.club/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${stored.qwenToken}`,
-    },
-    body: JSON.stringify({
-      model: "qwen3.5-flash", // Fast, responsive model ideal for sidebar use
-      messages: messages,
-      stream: false, // Phase 2: simple request/response. Streaming can come later.
-    }),
-    // Without this, a proxy that accepts the connection and then hangs leaves
-    // the panel stuck on "Thinking..." with the send button disabled, since
-    // nothing else ever settles this promise.
-    signal: AbortSignal.timeout(60000),
-  });
+  // Re-validated at send time, not only at save: storage could have been
+  // written by an earlier version of this extension, or by anything else with
+  // access to its storage area.
+  const baseUrlError = checkBaseUrl(config.baseUrl);
+  if (baseUrlError) {
+    return { error: baseUrlError, needsConfig: true };
+  }
 
-  if (res.status === 401) {
-    // The stored token is no longer usable — drop it so the status pill stops
-    // claiming "Authenticated" and the user is pointed at Refresh Auth.
-    await chrome.storage.session.remove("qwenToken");
+  const pairingError = checkKeyHostPairing(config.apiKey, config.baseUrl);
+  if (pairingError) {
+    return { error: pairingError, needsConfig: true };
+  }
+
+  const res = await fetch(
+    `${normalizeBaseUrl(config.baseUrl)}/chat/completions`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: config.model,
+        messages: messages,
+        stream: false,
+      }),
+      // Without this, an endpoint that accepts the connection and then hangs
+      // leaves the panel stuck on "Thinking..." with the send button disabled.
+      signal: AbortSignal.timeout(CHAT_TIMEOUT_MS),
+    },
+  );
+
+  if (res.status === 401 || res.status === 403) {
     return {
       error:
-        "Authentication expired or rejected. Open a chat.qwen.ai tab and click 'Refresh Auth'.",
-      authExpired: true,
+        "API key rejected. Check that the key is current and matches the base URL's billing mode.",
+      needsConfig: true,
+    };
+  }
+
+  if (res.status === 429) {
+    // Token Plan Lite caps at 700 credits per 5 hours and 2,500 per 7 days;
+    // hitting either pauses service until that window rolls over.
+    return {
+      error:
+        "Rate limited or quota exhausted. Token Plan quota resets on a rolling window — try again later.",
     };
   }
 
   if (!res.ok) {
-    // Include the body: a bare "HTTP 4xx" can't distinguish an expired token
-    // from a malformed request. Redact any echoed credential first — this
-    // string is rendered into the chat transcript.
     const body = await res.text().catch(() => "");
-    // Redact by value as well as by "Bearer " prefix — a body echoing the bare
-    // credential (e.g. {"token":"eyJ..."}) would slip past the prefix pattern.
-    const safeBody = body
-      .split(stored.qwenToken)
-      .join("[redacted]")
-      .replace(/Bearer\s+\S+/gi, "Bearer [redacted]");
+    const safeBody = redactSecret(body, config.apiKey);
     throw new Error(
       `HTTP ${res.status}${safeBody ? `: ${safeBody.slice(0, 200)}` : ""}`,
     );
@@ -284,7 +439,12 @@ async function sendChatMessage(messages) {
   const data = await res.json();
   const choice = data && data.choices && data.choices[0];
   if (!choice || !choice.message) {
-    return { error: "Unexpected API response", details: data };
+    // A 200 with an unexpected shape still carries an upstream body, and the
+    // panel renders details into the transcript — redact it the same way.
+    return {
+      error: "Unexpected API response",
+      details: redactSecret(JSON.stringify(data), config.apiKey).slice(0, 500),
+    };
   }
 
   return { content: choice.message.content };
@@ -321,23 +481,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   switch (message.type) {
-    case "AUTH_TOKEN":
-      respondAsync(
-        storeToken(message.token),
-        sendResponse,
-        "Failed to store token",
-      );
-      return true;
-
     case "GET_AUTH_STATUS":
-      respondAsync(getAuthStatus(), sendResponse, "Failed to read auth status");
+      respondAsync(getStatus(), sendResponse, "Failed to read status");
       return true;
 
-    case "REFRESH_AUTH":
+    case "SAVE_CONFIG":
       respondAsync(
-        refreshAuth(message.windowId),
+        saveConfig(message.config || {}),
         sendResponse,
-        "Refresh auth failed",
+        "Failed to save settings",
       );
       return true;
 
