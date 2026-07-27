@@ -1,0 +1,9 @@
+{
+  "name": "qwen-sidebar",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Qwen sidebar Chrome extension (MV3)",
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\""
+  }
+}

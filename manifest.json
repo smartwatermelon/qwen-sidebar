@@ -1,10 +1,11 @@
 {
   "manifest_version": 3,
   "name": "Qwen Sidebar",
-  "version": "1.0.0",
-  "description": "Qwen sidebar with DOM interactivity",
-  "permissions": ["sidePanel", "storage", "activeTab", "scripting"],
-  "host_permissions": ["https://chat.qwen.ai/*"],
+  "version": "2.0.0",
+  "description": "Chat with Qwen models in a side panel, optionally using the current page as context.",
+  "minimum_chrome_version": "116",
+  "permissions": ["sidePanel", "storage", "scripting"],
+  "host_permissions": ["https://*/*"],
   "action": {
     "default_title": "Open Qwen Sidebar"
   },
@@ -13,12 +14,5 @@
   },
   "side_panel": {
     "default_path": "sidepanel.html"
-  },
-  "content_scripts": [
-    {
-      "matches": ["https://chat.qwen.ai/*"],
-      "js": ["content.js"],
-      "run_at": "document_idle"
-    }
-  ]
+  }
 }

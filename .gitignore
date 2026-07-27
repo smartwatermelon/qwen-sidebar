@@ -1,0 +1,8 @@
+# Secrets. Do not rely on a global gitignore for these — that protection is
+# machine-local and does not survive a clone onto another machine or CI.
+.env
+.env.*
+!.env.example
+
+node_modules/
+.DS_Store
