@@ -1,6 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { loadBackground, runInPage, makeDocument, el } from "./helpers.mjs";
+import {
+  loadBackground,
+  runInPage,
+  makeDocument,
+  el,
+  makeMutablePage,
+  elementNode,
+} from "./helpers.mjs";
 
 const TOKEN_PLAN_URL =
   "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1";
@@ -662,6 +669,162 @@ test("bounds work on a pathological document", async () => {
 
   assert.ok(res.text.length < 4100);
   assert.ok(ms < 2000, `extraction took ${ms}ms`);
+});
+
+// ---------------------------------------------------------------------------
+// Highlight action
+// ---------------------------------------------------------------------------
+
+// Builds an inject stub that runs the real highlight/clear functions against a
+// mutable page stub, same "exercise the shipped code" posture as pageInjector.
+function highlightInjector(bodyChildren) {
+  const page = makeMutablePage(bodyChildren);
+  return {
+    inject: ({ func, args }) => [
+      { frameId: 0, result: runInPage(func, page, args) },
+    ],
+    body: page.document.body,
+  };
+}
+
+const NON_INJECTABLE_HIGHLIGHT_CASES = [
+  ["APPLY_HIGHLIGHT", { text: "x", color: "yellow" }],
+  ["CLEAR_HIGHLIGHTS", {}],
+];
+
+for (const [type, extra] of NON_INJECTABLE_HIGHLIGHT_CASES) {
+  test(`${type} refuses a chrome:// tab`, async () => {
+    const bg = loadBackground({
+      tabs: [{ id: 1, windowId: 10, url: "chrome://settings" }],
+      inject: () => {
+        throw new Error("must not inject");
+      },
+    });
+
+    const res = await bg.send({ type, windowId: 10, ...extra });
+    assert.match(res.error, /browser internal or extension pages/);
+  });
+
+  test(`${type} refuses a plain-http tab`, async () => {
+    const bg = loadBackground({
+      tabs: [{ id: 1, windowId: 10, url: "http://example.com" }],
+      inject: () => {
+        throw new Error("must not inject");
+      },
+    });
+
+    const res = await bg.send({ type, windowId: 10, ...extra });
+    assert.match(res.error, /https/);
+  });
+}
+
+test("an empty highlight text is rejected before injecting", async () => {
+  const bg = loadBackground({
+    tabs: [{ id: 1, windowId: 10, url: "https://example.com" }],
+    inject: () => {
+      throw new Error("must not inject");
+    },
+  });
+
+  const res = await bg.send({
+    type: "APPLY_HIGHLIGHT",
+    windowId: 10,
+    text: "   ",
+    color: "yellow",
+  });
+  assert.match(res.error, /No text/);
+});
+
+test("an overlong highlight text is rejected before injecting", async () => {
+  const bg = loadBackground({
+    tabs: [{ id: 1, windowId: 10, url: "https://example.com" }],
+    inject: () => {
+      throw new Error("must not inject");
+    },
+  });
+
+  const res = await bg.send({
+    type: "APPLY_HIGHLIGHT",
+    windowId: 10,
+    text: "x".repeat(500),
+    color: "yellow",
+  });
+  assert.match(res.error, /too long/);
+});
+
+test("a matching phrase is wrapped and the match count is returned", async () => {
+  const { inject, body } = highlightInjector([
+    elementNode("p", "the quick brown fox"),
+  ]);
+  const bg = loadBackground({
+    tabs: [{ id: 1, windowId: 10, url: "https://example.com" }],
+    inject,
+  });
+
+  const res = await bg.send({
+    type: "APPLY_HIGHLIGHT",
+    windowId: 10,
+    text: "quick brown",
+    color: "green",
+  });
+  assert.equal(res.count, 1);
+
+  const marks = body.querySelectorAll("mark[data-qwen-hl]");
+  assert.equal(marks.length, 1);
+  assert.equal(marks[0].textContent, "quick brown");
+});
+
+test("an unrecognized color name falls back to the default rather than erroring", async () => {
+  const { inject, body } = highlightInjector([elementNode("p", "hello world")]);
+  const bg = loadBackground({
+    tabs: [{ id: 1, windowId: 10, url: "https://example.com" }],
+    inject,
+  });
+
+  const res = await bg.send({
+    type: "APPLY_HIGHLIGHT",
+    windowId: 10,
+    text: "hello",
+    color: "not-a-real-color",
+  });
+  assert.equal(res.count, 1);
+
+  const marks = body.querySelectorAll("mark[data-qwen-hl]");
+  assert.equal(marks[0].style.backgroundColor, "#fff59d");
+});
+
+test("no match on the page is reported as an error, not a silent no-op", async () => {
+  const { inject } = highlightInjector([elementNode("p", "hello world")]);
+  const bg = loadBackground({
+    tabs: [{ id: 1, windowId: 10, url: "https://example.com" }],
+    inject,
+  });
+
+  const res = await bg.send({
+    type: "APPLY_HIGHLIGHT",
+    windowId: 10,
+    text: "not on the page",
+    color: "yellow",
+  });
+  assert.match(res.error, /No match found/);
+});
+
+test("CLEAR_HIGHLIGHTS unwraps every mark this extension created", async () => {
+  const mark = elementNode("mark", "quick brown");
+  mark.setAttribute("data-qwen-hl", "1");
+  const { inject, body } = highlightInjector([
+    elementNode("p", "the "),
+    mark,
+    elementNode("p", " fox"),
+  ]);
+  const bg = loadBackground({
+    tabs: [{ id: 1, windowId: 10, url: "https://example.com" }],
+    inject,
+  });
+
+  const res = await bg.send({ type: "CLEAR_HIGHLIGHTS", windowId: 10 });
+  assert.equal(res.count, 1);
+  assert.equal(body.querySelectorAll("mark[data-qwen-hl]").length, 0);
 });
 
 // ---------------------------------------------------------------------------

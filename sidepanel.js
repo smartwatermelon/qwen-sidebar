@@ -14,9 +14,138 @@ const settingsFeedback = document.getElementById("settings-feedback");
 
 const MAX_HISTORY_MESSAGES = 20;
 
-let messageHistory = [];
+// Tells the model how to request a highlight. Kept out of the visible
+// transcript (messageHistory[0], never rendered as a bubble) since it's
+// instruction, not conversation.
+const ACTION_SYSTEM_PROMPT =
+  "If highlighting text on the current page would help, append a single " +
+  'fenced block to your reply: ```json\n{"action":"highlight","text":"<exact ' +
+  'substring from the page>","color":"yellow"}\n```. Allowed color values: ' +
+  "yellow, green, pink, blue. Only include this block when the user's page " +
+  "context is in the conversation and highlighting genuinely helps; otherwise " +
+  "reply normally with no block.";
+
+let messageHistory = [{ role: "system", content: ACTION_SYSTEM_PROMPT }];
 let isWaiting = false;
 let authHintShown = false;
+
+// Matches a single ```json ... ``` fence — only the first, by design, since
+// the current protocol is one action per reply. The fence content is handed
+// whole to JSON.parse rather than pattern-matched for the closing brace — a
+// lazy [\s\S]*? stops at the first "}", which breaks on a text value that
+// itself contains a brace (e.g. text: "see {x}"). Anything before/after the
+// fence is the model's normal reply text.
+const ACTION_BLOCK_RE = /```json\s*([\s\S]*?)\s*```/;
+
+function extractActionBlock(content) {
+  const match = ACTION_BLOCK_RE.exec(content);
+  if (!match) return null;
+
+  let parsed;
+  try {
+    parsed = JSON.parse(match[1]);
+  } catch {
+    return null;
+  }
+
+  if (!parsed || parsed.action !== "highlight" || !parsed.text) return null;
+
+  return {
+    text: String(parsed.text),
+    color: typeof parsed.color === "string" ? parsed.color : "yellow",
+    remainingText: (
+      content.slice(0, match.index) +
+      content.slice(match.index + match[0].length)
+    ).trim(),
+  };
+}
+
+// Renders the Apply/Cancel card for a pending highlight action. Nothing
+// touches the page until Apply is clicked.
+function appendActionCard(action) {
+  const card = document.createElement("div");
+  card.className = "action-card";
+
+  const label = document.createElement("div");
+  label.className = "action-label";
+  label.textContent = `Highlight "${action.text}" (${action.color})`;
+  card.appendChild(label);
+
+  const buttons = document.createElement("div");
+  buttons.className = "action-buttons";
+
+  const applyBtn = document.createElement("button");
+  applyBtn.textContent = "Apply";
+  const cancelBtn = document.createElement("button");
+  cancelBtn.className = "action-cancel";
+  cancelBtn.textContent = "Cancel";
+
+  buttons.appendChild(applyBtn);
+  buttons.appendChild(cancelBtn);
+  card.appendChild(buttons);
+
+  cancelBtn.addEventListener("click", () => {
+    // Disable Apply too, not just remove the buttons: a click already in
+    // flight when Cancel fires would otherwise land after and overwrite the
+    // "Cancelled" label with a success/error one.
+    applyBtn.disabled = true;
+    buttons.remove();
+    label.textContent = `Cancelled: "${action.text}"`;
+  });
+
+  applyBtn.addEventListener("click", async () => {
+    applyBtn.disabled = true;
+    cancelBtn.disabled = true;
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: "APPLY_HIGHLIGHT",
+        windowId: await getHostWindowId(),
+        text: action.text,
+        color: action.color,
+      });
+      renderActionResult(card, buttons, label, action, response);
+    } catch (err) {
+      renderActionResult(card, buttons, label, action, { error: err.message });
+    }
+  });
+
+  chatContainer.appendChild(card);
+  chatContainer.scrollTop = chatContainer.scrollHeight;
+}
+
+function renderActionResult(card, buttons, label, action, response) {
+  buttons.remove();
+
+  if (response && response.error) {
+    label.textContent = response.error;
+    label.className = "action-label action-error";
+    return;
+  }
+
+  const count = (response && response.count) || 0;
+  label.textContent = `Highlighted ${count} match${count === 1 ? "" : "es"}`;
+  label.className = "action-label action-status";
+
+  const clearBtn = document.createElement("button");
+  clearBtn.className = "action-cancel";
+  clearBtn.textContent = "Clear";
+  clearBtn.addEventListener("click", async () => {
+    clearBtn.disabled = true;
+    try {
+      await chrome.runtime.sendMessage({
+        type: "CLEAR_HIGHLIGHTS",
+        windowId: await getHostWindowId(),
+      });
+      label.textContent = "Highlights cleared";
+      label.className = "action-label";
+      clearBtn.remove();
+    } catch (err) {
+      label.textContent = "Failed to clear: " + err.message;
+      label.className = "action-label action-error";
+    }
+  });
+  card.appendChild(clearBtn);
+}
 
 // Check auth status on load
 checkStatus();
@@ -191,13 +320,21 @@ async function sendMessage() {
         await checkStatus();
       }
     } else if (response && response.content) {
-      appendMessage("assistant", response.content);
+      const action = extractActionBlock(response.content);
+      const displayText = action ? action.remainingText : response.content;
+      if (displayText) appendMessage("assistant", displayText);
+      if (action) appendActionCard(action);
       messageHistory.push({ role: "assistant", content: response.content });
       // Every send posts the whole history, and a page-context block is up to
       // 4000 characters. Unbounded, that spends quota quadratically against a
-      // capped plan. Older turns stay visible in the transcript.
+      // capped plan. Older turns stay visible in the transcript. The system
+      // prompt at index 0 is never trimmed away — it must stay present for
+      // every request or the model loses the action-block instruction.
       if (messageHistory.length > MAX_HISTORY_MESSAGES) {
-        messageHistory = messageHistory.slice(-MAX_HISTORY_MESSAGES);
+        messageHistory = [
+          messageHistory[0],
+          ...messageHistory.slice(-(MAX_HISTORY_MESSAGES - 1)),
+        ];
       }
     } else {
       appendMessage("error", "Empty or malformed response from API.");
