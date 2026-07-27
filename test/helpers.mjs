@@ -99,9 +99,150 @@ export function makeDocument(bodyNode) {
 // Re-materializes `func` from its source in a fresh realm holding only the page
 // globals, then calls it. A ReferenceError here means the function was not
 // self-contained and would fail once serialized into a real page.
-export function runInPage(func, pageGlobals) {
+export function runInPage(func, pageGlobals, args = []) {
   const fn = vm.runInNewContext(`(${func.toString()})`, { ...pageGlobals });
-  return fn();
+  return fn(...args);
+}
+
+// --- Mutable DOM stub (highlight/clear injected functions) -------------------
+//
+// The read-only `el`/`makeDocument` stub above suffices for extraction, which
+// only reads text. Highlighting mutates the tree (splits text nodes, inserts
+// <mark> elements, unwraps them later), so it needs createElement/
+// createTextNode/insertBefore/removeChild/replaceChild/normalize and a
+// TreeWalker — a different, small stub rather than bolting mutation onto the
+// read-only one.
+
+function makeTextNode(value) {
+  return {
+    nodeType: 3,
+    nodeValue: value,
+    parentNode: null,
+    get parentElement() {
+      return this.parentNode;
+    },
+  };
+}
+
+function makeMutableElement(tag) {
+  return {
+    nodeType: 1,
+    tagName: tag.toUpperCase(),
+    children: [],
+    parentNode: null,
+    attributes: {},
+    style: {},
+    setAttribute(name, value) {
+      this.attributes[name] = value;
+    },
+    get textContent() {
+      return this.children
+        .map((c) => (c.nodeType === 3 ? c.nodeValue : c.textContent))
+        .join("");
+    },
+    set textContent(value) {
+      const node = makeTextNode(value);
+      node.parentNode = this;
+      this.children = [node];
+    },
+    insertBefore(newNode, refNode) {
+      const idx = refNode ? this.children.indexOf(refNode) : -1;
+      this.children.splice(idx === -1 ? this.children.length : idx, 0, newNode);
+      newNode.parentNode = this;
+      return newNode;
+    },
+    removeChild(node) {
+      const idx = this.children.indexOf(node);
+      if (idx !== -1) this.children.splice(idx, 1);
+      node.parentNode = null;
+      return node;
+    },
+    replaceChild(newNode, oldNode) {
+      const idx = this.children.indexOf(oldNode);
+      this.children[idx] = newNode;
+      newNode.parentNode = this;
+      oldNode.parentNode = null;
+      return oldNode;
+    },
+    normalize() {
+      const merged = [];
+      for (const c of this.children) {
+        const prev = merged[merged.length - 1];
+        if (c.nodeType === 3 && prev && prev.nodeType === 3) {
+          prev.nodeValue += c.nodeValue;
+        } else {
+          merged.push(c);
+        }
+      }
+      this.children = merged;
+    },
+    querySelectorAll(selector) {
+      return mutableQueryAll(this, selector);
+    },
+  };
+}
+
+function mutableQueryAll(root, selector) {
+  const match = /^(\w+)\[([\w-]+)\]$/.exec(selector);
+  const out = [];
+  const walk = (node) => {
+    for (const child of node.children) {
+      if (child.nodeType === 1) {
+        if (match && child.tagName === match[1].toUpperCase() && match[2] in child.attributes) {
+          out.push(child);
+        }
+        walk(child);
+      }
+    }
+  };
+  walk(root);
+  return out;
+}
+
+/** Page globals for running highlightTextOnPage/clearHighlightsOnPage. */
+export function makeMutablePage(bodyChildren) {
+  const body = makeMutableElement("body");
+  for (const child of bodyChildren) {
+    child.parentNode = body;
+    body.children.push(child);
+  }
+
+  const document = {
+    body,
+    createElement: (tag) => makeMutableElement(tag),
+    createTextNode: (value) => makeTextNode(value),
+    createTreeWalker(root, _whatToShow, filter) {
+      const nodes = [];
+      const walk = (node) => {
+        for (const child of node.children) {
+          if (child.nodeType === 3) {
+            if (!filter || filter.acceptNode(child) === 1) nodes.push(child);
+          } else if (child.nodeType === 1) {
+            walk(child);
+          }
+        }
+      };
+      walk(root);
+      let i = -1;
+      return { nextNode: () => (++i < nodes.length ? nodes[i] : null) };
+    },
+    querySelectorAll: (selector) => mutableQueryAll(body, selector),
+  };
+
+  return {
+    document,
+    NodeFilter: { SHOW_TEXT: 4, FILTER_ACCEPT: 1, FILTER_REJECT: 2 },
+  };
+}
+
+export function textNode(value) {
+  return makeTextNode(value);
+}
+
+export function elementNode(tag, textContent) {
+  const node = makeMutableElement(tag);
+  if (textContent !== undefined) node.textContent = textContent;
+  return node;
 }
 
 // --- Background loader -------------------------------------------------------
@@ -162,9 +303,9 @@ export function loadBackground(opts = {}) {
       },
     },
     scripting: {
-      executeScript: async ({ target, func }) => {
+      executeScript: async ({ target, func, args }) => {
         if (!opts.inject) throw new Error("no inject stub configured");
-        return opts.inject({ tabId: target.tabId, func });
+        return opts.inject({ tabId: target.tabId, func, args });
       },
     },
   };

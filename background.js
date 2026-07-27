@@ -41,6 +41,21 @@ const CONFIG_DEFAULTS = {
 
 const CHAT_TIMEOUT_MS = 60000;
 
+// Highlight action: an exact-match allowlist, same posture as
+// TOKEN_PLAN_MODELS — a model-supplied color name is untrusted input and
+// must never reach a style attribute directly (CSS injection). An
+// unrecognized name falls back to the default rather than erroring, since a
+// hallucinated color shouldn't block an otherwise-valid highlight.
+const HIGHLIGHT_COLORS = {
+  yellow: "#fff59d",
+  green: "#a5d6a7",
+  pink: "#f8bbd0",
+  blue: "#90caf9",
+};
+const DEFAULT_HIGHLIGHT_COLOR = "yellow";
+const MAX_HIGHLIGHT_TEXT_LENGTH = 200;
+const MAX_HIGHLIGHT_MATCHES = 50;
+
 function parseUrl(rawUrl) {
   if (!rawUrl) return null;
   try {
@@ -71,10 +86,11 @@ async function getActiveTab(windowId) {
 // resolves with a per-frame `error`. The frame.error branch below is therefore
 // inert on Chrome and load-bearing on Firefox; it is kept so a port doesn't
 // silently swallow in-page exceptions.
-async function injectAndRead(tabId, func) {
+async function injectAndRead(tabId, func, args = []) {
   const frames = await chrome.scripting.executeScript({
     target: { tabId: tabId },
     func: func,
+    args: args,
   });
 
   const frame = frames && frames[0];
@@ -171,6 +187,81 @@ function extractPageContent() {
   }
 
   return { type: "page", text: limit(text), ...provenance };
+}
+
+// Serialized and run in the page — same self-containment constraint as
+// extractPageContent: no closures over outer scope. Args arrive through
+// executeScript's `args`, not by capture.
+//
+// Matches within a single text node only — a phrase split across elements
+// (e.g. "<b>quick</b> brown") won't match. Reconstructing text across node
+// boundaries to support that adds real complexity (mapping a match back to
+// multiple ranges to wrap) for a rare phrasing; out of scope for this slice.
+function highlightTextOnPage(text, hex, maxMatches) {
+  const needle = text.toLowerCase();
+  // MARK is skipped too, so a second highlight request can't re-match text
+  // already wrapped by a prior one and produce nested marks.
+  const skipTags = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "MARK"]);
+
+  const walker = document.createTreeWalker(
+    document.body,
+    NodeFilter.SHOW_TEXT,
+    {
+      acceptNode: (node) =>
+        node.parentElement && !skipTags.has(node.parentElement.tagName)
+          ? NodeFilter.FILTER_ACCEPT
+          : NodeFilter.FILTER_REJECT,
+    },
+  );
+
+  // Collect nodes first: mutating the tree (splitting text nodes) while the
+  // walker is mid-traversal would skip or revisit nodes.
+  const nodes = [];
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    nodes.push(node);
+  }
+
+  let count = 0;
+  for (const node of nodes) {
+    if (count >= maxMatches) break;
+
+    const value = node.nodeValue;
+    const lower = value.toLowerCase();
+    const idx = lower.indexOf(needle);
+    if (idx === -1) continue;
+
+    const before = value.slice(0, idx);
+    const match = value.slice(idx, idx + text.length);
+    const after = value.slice(idx + text.length);
+
+    const mark = document.createElement("mark");
+    mark.setAttribute("data-qwen-hl", "1");
+    mark.style.backgroundColor = hex;
+    mark.textContent = match;
+
+    const parent = node.parentNode;
+    if (before) parent.insertBefore(document.createTextNode(before), node);
+    parent.insertBefore(mark, node);
+    if (after) parent.insertBefore(document.createTextNode(after), node);
+    parent.removeChild(node);
+
+    count += 1;
+  }
+
+  return count;
+}
+
+// Unwraps every mark this extension created, merging its text back into the
+// surrounding node. Self-contained for the same reason as above.
+function clearHighlightsOnPage() {
+  const marks = document.querySelectorAll("mark[data-qwen-hl]");
+  for (const mark of marks) {
+    const parent = mark.parentNode;
+    if (!parent) continue;
+    parent.replaceChild(document.createTextNode(mark.textContent), mark);
+    parent.normalize();
+  }
+  return marks.length;
 }
 
 // --- Configuration -----------------------------------------------------------
@@ -329,7 +420,11 @@ async function saveConfig(patch) {
 
 // --- Message handlers --------------------------------------------------------
 
-async function getPageContext(windowId) {
+// Shared by every action that injects into the active tab: resolves the tab
+// and applies the same https-only gating getPageContext already enforced, so
+// a highlight request against a chrome:// or plain-http page fails the same
+// way page-context extraction does rather than a second, divergent check.
+async function getInjectableTab(windowId) {
   const tab = await getActiveTab(windowId);
   if (!tab) {
     return { error: "No active tab found." };
@@ -337,19 +432,26 @@ async function getPageContext(windowId) {
 
   const url = parseUrl(tab.url);
   if (url && url.protocol === "http:") {
-    // Distinct from the message below: an intranet page over plain HTTP is
-    // neither internal nor an extension page, and telling the user it is sends
-    // them looking for the wrong problem.
     return {
       error:
-        "Page context requires an https page. This extension does not request access to plain HTTP pages.",
+        "This action requires an https page. This extension does not request access to plain HTTP pages.",
     };
   }
   if (!url || !INJECTABLE_PROTOCOLS.has(url.protocol)) {
     return {
-      error: "Cannot read context from browser internal or extension pages.",
+      error: "Cannot act on browser internal or extension pages.",
     };
   }
+
+  return { tab };
+}
+
+async function getPageContext(windowId) {
+  const gated = await getInjectableTab(windowId);
+  if (gated.error) {
+    return { error: gated.error };
+  }
+  const tab = gated.tab;
 
   const extracted = await injectAndRead(tab.id, extractPageContent);
   if (!extracted || !extracted.text) {
@@ -364,6 +466,52 @@ async function getPageContext(windowId) {
     url: extracted.url || tab.url,
     title: extracted.title || tab.title || "",
   };
+}
+
+async function applyHighlight(windowId, text, color) {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) {
+    return { error: "No text to highlight." };
+  }
+  if (trimmed.length > MAX_HIGHLIGHT_TEXT_LENGTH) {
+    return { error: "Highlight text is too long." };
+  }
+
+  // Tab is resolved once here and reused below; if the user switches the
+  // active tab in the (single-digit ms) gap before injection, the highlight
+  // lands on the tab they had selected when they clicked Apply, not
+  // whatever is active by the time it runs. Low-stakes and not worth an
+  // extra re-validation round-trip for this slice.
+  const gated = await getInjectableTab(windowId);
+  if (gated.error) {
+    return { error: gated.error };
+  }
+
+  // An unrecognized color name falls back to the default rather than
+  // rejecting the request — see the comment on HIGHLIGHT_COLORS.
+  const hex =
+    HIGHLIGHT_COLORS[color] || HIGHLIGHT_COLORS[DEFAULT_HIGHLIGHT_COLOR];
+
+  const count = await injectAndRead(gated.tab.id, highlightTextOnPage, [
+    trimmed,
+    hex,
+    MAX_HIGHLIGHT_MATCHES,
+  ]);
+
+  if (!count) {
+    return { error: `No match found for "${trimmed}" on this page.` };
+  }
+  return { count };
+}
+
+async function clearHighlights(windowId) {
+  const gated = await getInjectableTab(windowId);
+  if (gated.error) {
+    return { error: gated.error };
+  }
+
+  const count = await injectAndRead(gated.tab.id, clearHighlightsOnPage);
+  return { count };
 }
 
 async function sendChatMessage(messages) {
@@ -506,6 +654,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendChatMessage(message.messages),
         sendResponse,
         "API error",
+      );
+      return true;
+
+    case "APPLY_HIGHLIGHT":
+      respondAsync(
+        applyHighlight(message.windowId, message.text, message.color),
+        sendResponse,
+        "Failed to apply highlight",
+      );
+      return true;
+
+    case "CLEAR_HIGHLIGHTS":
+      respondAsync(
+        clearHighlights(message.windowId),
+        sendResponse,
+        "Failed to clear highlights",
       );
       return true;
 
