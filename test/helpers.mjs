@@ -16,6 +16,7 @@ import vm from "node:vm";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BACKGROUND = path.join(HERE, "..", "background.js");
+const SIDEPANEL = path.join(HERE, "..", "sidepanel.js");
 
 // --- DOM stubs ---------------------------------------------------------------
 
@@ -356,4 +357,55 @@ export function loadBackground(opts = {}) {
       return replyCount;
     },
   };
+}
+
+// --- Sidepanel loader ---------------------------------------------------------
+
+// sidepanel.js is a classic script, not a module: it wires up DOM elements and
+// registers event listeners at top level, and calls checkStatus() immediately.
+// Loading it into a vm context needs a minimal `document`/`chrome` stub good
+// enough to satisfy that top-level code without throwing — the tests below only
+// exercise extractActionBlock(), a pure function pulled off the resulting
+// sandbox, so the stub does not need to support real DOM mutation.
+function stubElement() {
+  const listeners = {};
+  return {
+    addEventListener(type, fn) {
+      listeners[type] = fn;
+    },
+    classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+    style: {},
+    options: [],
+    appendChild() {},
+    dispatchEvent() {},
+    focus() {},
+    get value() {
+      return this._value || "";
+    },
+    set value(v) {
+      this._value = v;
+    },
+  };
+}
+
+/** Loads sidepanel.js into a vm context and returns its top-level bindings. */
+export function loadSidepanel() {
+  const document = {
+    getElementById: () => stubElement(),
+    createElement: () => stubElement(),
+  };
+
+  const chrome = {
+    runtime: {
+      sendMessage: async () => ({ isAuthenticated: false }),
+    },
+    windows: {
+      getCurrent: async () => ({ id: 1 }),
+    },
+  };
+
+  const sandbox = { document, chrome, console };
+  vm.createContext(sandbox);
+  vm.runInContext(readFileSync(SIDEPANEL, "utf8"), sandbox);
+  return sandbox;
 }

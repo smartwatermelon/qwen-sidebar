@@ -29,16 +29,20 @@ let messageHistory = [{ role: "system", content: ACTION_SYSTEM_PROMPT }];
 let isWaiting = false;
 let authHintShown = false;
 
-// Matches a single ```json ... ``` fence — only the first, by design, since
-// the current protocol is one action per reply. The fence content is handed
-// whole to JSON.parse rather than pattern-matched for the closing brace — a
-// lazy [\s\S]*? stops at the first "}", which breaks on a text value that
-// itself contains a brace (e.g. text: "see {x}"). Anything before/after the
-// fence is the model's normal reply text.
-const ACTION_BLOCK_RE = /```json\s*([\s\S]*?)\s*```/;
+// Matches every ```json ... ``` fence in a reply. The action block is expected
+// to be appended last (per ACTION_SYSTEM_PROMPT), but the model's prose can
+// contain its own inline ```json blocks earlier in the same reply (e.g.
+// explaining a JSON structure to the user) — so extractActionBlock() below
+// takes the *last* match, not the first. The fence content is handed whole to
+// JSON.parse rather than pattern-matched for the closing brace — a lazy
+// [\s\S]*? stops at the first "}", which breaks on a text value that itself
+// contains a brace (e.g. text: "see {x}"). Anything before/after the fence is
+// the model's normal reply text.
+const ACTION_BLOCK_RE = /```json\s*([\s\S]*?)\s*```/g;
 
 function extractActionBlock(content) {
-  const match = ACTION_BLOCK_RE.exec(content);
+  const matches = [...content.matchAll(ACTION_BLOCK_RE)];
+  const match = matches[matches.length - 1];
   if (!match) return null;
 
   let parsed;
