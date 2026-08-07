@@ -227,25 +227,38 @@ function highlightTextOnPage(text, hex, maxMatches) {
 
     const value = node.nodeValue;
     const lower = value.toLowerCase();
-    const idx = lower.indexOf(needle);
-    if (idx === -1) continue;
-
-    const before = value.slice(0, idx);
-    const match = value.slice(idx, idx + text.length);
-    const after = value.slice(idx + text.length);
-
-    const mark = document.createElement("mark");
-    mark.setAttribute("data-qwen-hl", "1");
-    mark.style.backgroundColor = hex;
-    mark.textContent = match;
-
     const parent = node.parentNode;
-    if (before) parent.insertBefore(document.createTextNode(before), node);
-    parent.insertBefore(mark, node);
+
+    // Walk every occurrence within this node's value, not just the first,
+    // inserting a <mark> plus the untouched text around it for each hit and
+    // finally dropping the original node once all its pieces are in place.
+    let cursor = 0;
+    let sawMatch = false;
+    while (count < maxMatches) {
+      const idx = lower.indexOf(needle, cursor);
+      if (idx === -1) break;
+
+      const before = value.slice(cursor, idx);
+      const match = value.slice(idx, idx + text.length);
+
+      const mark = document.createElement("mark");
+      mark.setAttribute("data-qwen-hl", "1");
+      mark.style.backgroundColor = hex;
+      mark.textContent = match;
+
+      if (before) parent.insertBefore(document.createTextNode(before), node);
+      parent.insertBefore(mark, node);
+
+      sawMatch = true;
+      count += 1;
+      cursor = idx + text.length;
+    }
+
+    if (!sawMatch) continue;
+
+    const after = value.slice(cursor);
     if (after) parent.insertBefore(document.createTextNode(after), node);
     parent.removeChild(node);
-
-    count += 1;
   }
 
   return count;

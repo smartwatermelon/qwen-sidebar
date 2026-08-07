@@ -774,6 +774,54 @@ test("a matching phrase is wrapped and the match count is returned", async () =>
   assert.equal(marks[0].textContent, "quick brown");
 });
 
+test("every occurrence within a single text node is highlighted, not just the first", async () => {
+  const { inject, body } = highlightInjector([
+    elementNode("p", "the quick fox and the quick hare raced the quick tortoise"),
+  ]);
+  const bg = loadBackground({
+    tabs: [{ id: 1, windowId: 10, url: "https://example.com" }],
+    inject,
+  });
+
+  const res = await bg.send({
+    type: "APPLY_HIGHLIGHT",
+    windowId: 10,
+    text: "quick",
+    color: "green",
+  });
+  assert.equal(res.count, 3);
+
+  const marks = body.querySelectorAll("mark[data-qwen-hl]");
+  assert.equal(marks.length, 3);
+  for (const mark of marks) {
+    assert.equal(mark.textContent, "quick");
+  }
+  // The non-matching text around each hit must survive intact and in order.
+  assert.equal(
+    body.textContent,
+    "the quick fox and the quick hare raced the quick tortoise",
+  );
+});
+
+test("within-node matches still respect the global maxMatches cap", async () => {
+  const { inject, body } = highlightInjector([
+    elementNode("p", "aa aa aa aa"),
+  ]);
+  const bg = loadBackground({
+    tabs: [{ id: 1, windowId: 10, url: "https://example.com" }],
+    inject: ({ func, args }) => inject({ func, args: [args[0], args[1], 2] }),
+  });
+
+  const res = await bg.send({
+    type: "APPLY_HIGHLIGHT",
+    windowId: 10,
+    text: "aa",
+    color: "green",
+  });
+  assert.equal(res.count, 2);
+  assert.equal(body.querySelectorAll("mark[data-qwen-hl]").length, 2);
+});
+
 test("an unrecognized color name falls back to the default rather than erroring", async () => {
   const { inject, body } = highlightInjector([elementNode("p", "hello world")]);
   const bg = loadBackground({
