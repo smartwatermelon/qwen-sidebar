@@ -160,6 +160,16 @@ function makeMutableElement(tag) {
     },
     replaceChild(newNode, oldNode) {
       const idx = this.children.indexOf(oldNode);
+      // Real DOM throws NotFoundError here rather than mutating anything.
+      // Without this guard, idx === -1 makes `this.children[-1] = newNode`
+      // set a non-integer property on the array instead of replacing
+      // anything, while still linking newNode.parentNode to this element —
+      // silent corruption instead of a loud failure.
+      if (idx === -1) {
+        throw new Error(
+          "Failed to execute 'replaceChild': the node to be replaced is not a child of this node",
+        );
+      }
       this.children[idx] = newNode;
       newNode.parentNode = this;
       oldNode.parentNode = null;
