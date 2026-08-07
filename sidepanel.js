@@ -37,7 +37,9 @@ let authHintShown = false;
 // JSON.parse rather than pattern-matched for the closing brace — a lazy
 // [\s\S]*? stops at the first "}", which breaks on a text value that itself
 // contains a brace (e.g. text: "see {x}"). Anything before/after the fence is
-// the model's normal reply text.
+// the model's normal reply text. Use .matchAll() rather than .exec() here —
+// the `g` flag makes .exec() stateful on a shared regex instance (it resumes
+// from .lastIndex on each call), which .matchAll() sidesteps entirely.
 const ACTION_BLOCK_RE = /```json\s*([\s\S]*?)\s*```/g;
 
 function extractActionBlock(content) {
