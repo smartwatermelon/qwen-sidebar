@@ -842,6 +842,37 @@ test("an unrecognized color name falls back to the default rather than erroring"
   assert.equal(marks[0].style.backgroundColor, "#fff59d");
 });
 
+// Regression test: idx is located in `lower`/`needle` (both case-folded), so
+// the match slice and cursor advance must use needle.length, not
+// text.length. The Turkish dotted capital İ (U+0130) lowercases to "i̇" — an
+// "i" plus a combining dot above, two UTF-16 code units instead of one — so
+// text.length (8, for "İstanbul") and needle.length (9) diverge. Using
+// text.length truncates the match by one character and leaks that character
+// into the trailing text instead of the mark.
+test("a search term whose lowercase form is longer (Turkish İ) is matched in full", async () => {
+  const { inject, body } = highlightInjector([
+    elementNode("p", "Welcome to i̇stanbul today"),
+  ]);
+  const bg = loadBackground({
+    tabs: [{ id: 1, windowId: 10, url: "https://example.com" }],
+    inject,
+  });
+
+  const res = await bg.send({
+    type: "APPLY_HIGHLIGHT",
+    windowId: 10,
+    text: "İstanbul",
+    color: "yellow",
+  });
+  assert.equal(res.count, 1);
+
+  const marks = body.querySelectorAll("mark[data-qwen-hl]");
+  assert.equal(marks.length, 1);
+  assert.equal(marks[0].textContent, "i̇stanbul");
+  // The full page text must be preserved with nothing dropped or duplicated.
+  assert.equal(body.textContent, "Welcome to i̇stanbul today");
+});
+
 test("no match on the page is reported as an error, not a silent no-op", async () => {
   const { inject } = highlightInjector([elementNode("p", "hello world")]);
   const bg = loadBackground({
@@ -894,6 +925,22 @@ test("replaceChild on the mutable DOM stub throws when oldNode is not a child", 
   assert.deepEqual(document.body.children, before);
   assert.equal(replacement.parentNode, null);
   assert.equal(detached.parentNode, null);
+});
+
+test("removeChild on the mutable DOM stub throws when node is not a child", () => {
+  const { document } = makeMutablePage([elementNode("p", "hello")]);
+  const detached = elementNode("mark", "quick brown");
+  detached.parentNode = "not-really-attached"; // pre-set, to prove it isn't cleared
+
+  const before = [...document.body.children];
+  assert.throws(() => document.body.removeChild(detached), {
+    message: /not a child/,
+  });
+
+  // No corruption: children array unchanged, and the detached node's
+  // parentNode wasn't blown away by a no-op removal.
+  assert.deepEqual(document.body.children, before);
+  assert.equal(detached.parentNode, "not-really-attached");
 });
 
 // ---------------------------------------------------------------------------

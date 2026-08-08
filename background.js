@@ -239,7 +239,13 @@ function highlightTextOnPage(text, hex, maxMatches) {
       if (idx === -1) break;
 
       const before = value.slice(cursor, idx);
-      const match = value.slice(idx, idx + text.length);
+      // idx was located in `lower` via `needle` (both case-folded), so the
+      // match slice and cursor advance must use needle.length, not
+      // text.length: a lowercase form can have a different UTF-16 code-unit
+      // count than the original (e.g. "İ" -> "i̇" in Turkish locale, or
+      // ligatures), which would otherwise miss or double-highlight a
+      // character at each match.
+      const match = value.slice(idx, idx + needle.length);
 
       const mark = document.createElement("mark");
       mark.setAttribute("data-qwen-hl", "1");
@@ -251,7 +257,7 @@ function highlightTextOnPage(text, hex, maxMatches) {
 
       sawMatch = true;
       count += 1;
-      cursor = idx + text.length;
+      cursor = idx + needle.length;
     }
 
     if (!sawMatch) continue;

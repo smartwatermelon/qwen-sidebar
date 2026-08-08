@@ -90,10 +90,16 @@ function appendActionCard(action) {
   buttons.appendChild(cancelBtn);
   card.appendChild(buttons);
 
+  // Disabling Apply on Cancel only stops *future* clicks — an Apply click
+  // already in flight when Cancel fires has its sendMessage() promise
+  // pending, and that promise resolving later would otherwise call
+  // renderActionResult() and unconditionally overwrite the "Cancelled" label
+  // with a success/error one. This flag lets the in-flight handler notice
+  // Cancel happened after it started and skip rendering its own result.
+  let cancelled = false;
+
   cancelBtn.addEventListener("click", () => {
-    // Disable Apply too, not just remove the buttons: a click already in
-    // flight when Cancel fires would otherwise land after and overwrite the
-    // "Cancelled" label with a success/error one.
+    cancelled = true;
     applyBtn.disabled = true;
     buttons.remove();
     label.textContent = `Cancelled: "${action.text}"`;
@@ -109,9 +115,14 @@ function appendActionCard(action) {
         text: action.text,
         color: action.color,
       });
-      renderActionResult(card, buttons, label, action, response);
+      if (!cancelled)
+        renderActionResult(card, buttons, label, action, response);
     } catch (err) {
-      renderActionResult(card, buttons, label, action, { error: err.message });
+      if (!cancelled) {
+        renderActionResult(card, buttons, label, action, {
+          error: err.message,
+        });
+      }
     }
   });
 
