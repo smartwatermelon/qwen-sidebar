@@ -114,3 +114,49 @@ test("a failed send surfaces the upstream error, not an Event ReferenceError", a
   );
   assert.equal(userInput.value, "hello there");
 });
+
+// Regression test for the Apply/Cancel race: clicking Apply starts an async
+// APPLY_HIGHLIGHT round trip; clicking Cancel before it resolves must leave
+// the "Cancelled" label in place. Before the fix, renderActionResult()
+// unconditionally overwrote label.textContent once the in-flight response
+// arrived, clobbering "Cancelled" with a success/error message.
+test("Cancel wins a race against an Apply response that resolves after it", async () => {
+  // A deferred APPLY_HIGHLIGHT response the test can resolve on demand, so
+  // Cancel can be clicked while it's still pending.
+  let resolveApply;
+  const applyResponse = new Promise((resolve) => {
+    resolveApply = resolve;
+  });
+
+  const sandbox = loadSidepanel({
+    sendMessage: async (msg) => {
+      if (msg.type === "APPLY_HIGHLIGHT") return applyResponse;
+      return { isAuthenticated: false };
+    },
+  });
+
+  const chatContainer = sandbox.__elements.get("chat-container");
+  sandbox.appendActionCard({ text: "foo", color: "yellow" });
+
+  const card = chatContainer.appended[0];
+  const label = card.appended[0];
+  const buttons = card.appended[1];
+  const applyBtn = buttons.appended[0];
+  const cancelBtn = buttons.appended[1];
+
+  // Click Apply: kicks off the (still-pending) sendMessage call.
+  const applyClick = applyBtn.listeners.click();
+  // Click Cancel before the response arrives.
+  cancelBtn.listeners.click();
+  assert.equal(label.textContent, 'Cancelled: "foo"');
+
+  // Now let the in-flight Apply response resolve.
+  resolveApply({ count: 3 });
+  await applyClick;
+
+  assert.equal(
+    label.textContent,
+    'Cancelled: "foo"',
+    "the in-flight Apply response must not overwrite the Cancelled label",
+  );
+});

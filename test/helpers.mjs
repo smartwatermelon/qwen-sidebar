@@ -393,6 +393,9 @@ function stubElement() {
     addEventListener(type, fn) {
       listeners[type] = fn;
     },
+    // Exposed so tests can drive a registered handler directly (e.g.
+    // simulating a button click) without a real DOM event system.
+    listeners,
     classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
     style: {},
     options: [],
@@ -405,6 +408,7 @@ function stubElement() {
     dispatchEvent() {},
     focus() {},
     remove() {},
+    disabled: false,
     get value() {
       return this._value || "";
     },
