@@ -379,6 +379,7 @@ export function loadBackground(opts = {}) {
 // sandbox, so the stub does not need to support real DOM mutation.
 function stubElement() {
   const listeners = {};
+  const appended = [];
   return {
     addEventListener(type, fn) {
       listeners[type] = fn;
@@ -386,9 +387,15 @@ function stubElement() {
     classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
     style: {},
     options: [],
-    appendChild() {},
+    // Recorded so tests can assert on what a container (e.g. chatContainer)
+    // accumulated — e.g. the text of the last appended message bubble.
+    appended,
+    appendChild(child) {
+      appended.push(child);
+    },
     dispatchEvent() {},
     focus() {},
+    remove() {},
     get value() {
       return this._value || "";
     },
@@ -398,24 +405,36 @@ function stubElement() {
   };
 }
 
-/** Loads sidepanel.js into a vm context and returns its top-level bindings. */
-export function loadSidepanel() {
+/**
+ * Loads sidepanel.js into a vm context and returns its top-level bindings.
+ * @param {object} [opts]
+ * @param {Function} [opts.sendMessage] stub for chrome.runtime.sendMessage,
+ *   overriding the default GET_AUTH_STATUS-only response — lets tests drive
+ *   paths (e.g. sendMessage()'s error branch) that depend on what the
+ *   background script returns.
+ */
+export function loadSidepanel(opts = {}) {
+  const elements = new Map();
   const document = {
-    getElementById: () => stubElement(),
+    getElementById(id) {
+      if (!elements.has(id)) elements.set(id, stubElement());
+      return elements.get(id);
+    },
     createElement: () => stubElement(),
   };
 
   const chrome = {
     runtime: {
-      sendMessage: async () => ({ isAuthenticated: false }),
+      sendMessage: opts.sendMessage || (async () => ({ isAuthenticated: false })),
     },
     windows: {
       getCurrent: async () => ({ id: 1 }),
     },
   };
 
-  const sandbox = { document, chrome, console };
+  const sandbox = { document, chrome, console, Event };
   vm.createContext(sandbox);
   vm.runInContext(readFileSync(SIDEPANEL, "utf8"), sandbox);
+  sandbox.__elements = elements;
   return sandbox;
 }
