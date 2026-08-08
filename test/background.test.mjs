@@ -896,6 +896,22 @@ test("replaceChild on the mutable DOM stub throws when oldNode is not a child", 
   assert.equal(detached.parentNode, null);
 });
 
+test("removeChild on the mutable DOM stub throws when node is not a child", () => {
+  const { document } = makeMutablePage([elementNode("p", "hello")]);
+  const detached = elementNode("mark", "quick brown");
+  detached.parentNode = "not-really-attached"; // pre-set, to prove it isn't cleared
+
+  const before = [...document.body.children];
+  assert.throws(() => document.body.removeChild(detached), {
+    message: /not a child/,
+  });
+
+  // No corruption: children array unchanged, and the detached node's
+  // parentNode wasn't blown away by a no-op removal.
+  assert.deepEqual(document.body.children, before);
+  assert.equal(detached.parentNode, "not-really-attached");
+});
+
 // ---------------------------------------------------------------------------
 // Response plumbing
 // ---------------------------------------------------------------------------

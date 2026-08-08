@@ -154,7 +154,16 @@ function makeMutableElement(tag) {
     },
     removeChild(node) {
       const idx = this.children.indexOf(node);
-      if (idx !== -1) this.children.splice(idx, 1);
+      // Real DOM throws NotFoundError here rather than mutating anything —
+      // same divergence class as replaceChild below. Without this guard,
+      // idx === -1 both no-ops the splice (nothing removed) and still clears
+      // node.parentNode, corrupting a detached node's state silently.
+      if (idx === -1) {
+        throw new Error(
+          "Failed to execute 'removeChild': the node to be removed is not a child of this node",
+        );
+      }
+      this.children.splice(idx, 1);
       node.parentNode = null;
       return node;
     },
